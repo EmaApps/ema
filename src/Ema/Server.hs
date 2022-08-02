@@ -1,83 +1,95 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Ema.Server where
 
 import Control.Concurrent.Async (race)
-import Control.Exception (catch, try)
+import Control.Exception (try)
 import Control.Monad.Logger
-import Data.Default
 import Data.LVar (LVar)
 import Data.LVar qualified as LVar
 import Data.Text qualified as T
-import Ema.Asset
-import Ema.Class (Ema (..))
-import GHC.IO.Unsafe (unsafePerformIO)
+import Ema.Asset (
+  Asset (AssetGenerated, AssetStatic),
+  Format (Html, Other),
+ )
+import Ema.CLI (Host (unHost))
+import Ema.Route.Class (IsRoute (RouteModel, routePrism))
+import Ema.Route.Prism (
+  checkRoutePrismGivenFilePath,
+  fromPrism_,
+ )
+import Ema.Route.Url (urlToFilePath)
+import Ema.Site (EmaSite (siteOutput), EmaStaticSite)
 import NeatInterpolation (text)
 import Network.HTTP.Types qualified as H
 import Network.Wai qualified as Wai
+import Network.Wai.Handler.Warp (Port)
 import Network.Wai.Handler.Warp qualified as Warp
 import Network.Wai.Handler.WebSockets qualified as WaiWs
 import Network.Wai.Middleware.Static qualified as Static
 import Network.WebSockets (ConnectionException)
 import Network.WebSockets qualified as WS
-import System.FilePath ((</>))
+import Optics.Core (review)
 import Text.Printf (printf)
 import UnliftIO (MonadUnliftIO)
-
--- | Host string to start the server on.
-newtype Host = Host {unHost :: Text}
-  deriving newtype (Eq, Show, Ord, IsString)
-
--- | Port number to bind the server on.
-newtype Port = Port {unPort :: Int}
-  deriving newtype (Eq, Show, Ord, Num, Read)
-
-instance Default Host where
-  def = "127.0.0.1"
-
-instance Default Port where
-  def = 8000
+import UnliftIO.Concurrent (threadDelay)
+import UnliftIO.Exception (catch)
 
 runServerWithWebSocketHotReload ::
   forall r m.
-  ( Ema r,
-    Show r,
-    MonadIO m,
-    MonadUnliftIO m,
-    MonadLoggerIO m
+  ( Show r
+  , MonadIO m
+  , MonadUnliftIO m
+  , MonadLoggerIO m
+  , Eq r
+  , IsRoute r
+  , EmaStaticSite r
   ) =>
   Host ->
-  Port ->
-  LVar (ModelFor r) ->
-  (ModelFor r -> r -> Asset LByteString) ->
+  Maybe Port ->
+  LVar (RouteModel r) ->
   m ()
-runServerWithWebSocketHotReload host port model render = do
-  let settings =
-        Warp.defaultSettings
-          & Warp.setPort (unPort port)
-          & Warp.setHost (fromString . toString . unHost $ host)
+runServerWithWebSocketHotReload host mport model = do
   logger <- askLoggerIO
-
-  logInfoN "=============================================="
-  logInfoN $ "Ema live server running: http://" <> unHost host <> ":" <> show port
-  logInfoN "=============================================="
-  liftIO $
-    Warp.runSettings settings $
-      assetsMiddleware $
+  let runM = flip runLoggingT logger
+      settings =
+        Warp.defaultSettings
+          & Warp.setHost (fromString . toString . unHost $ host)
+      app =
         WaiWs.websocketsOr
           WS.defaultConnectionOptions
-          (flip runLoggingT logger . wsApp)
+          (runM . wsApp)
           (httpApp logger)
+      banner port = do
+        logInfoNS "ema" "==============================================="
+        logInfoNS "ema" $ "Ema live server RUNNING: http://" <> unHost host <> ":" <> show port
+        logInfoNS "ema" "==============================================="
+  liftIO $ warpRunSettings settings mport (runM . banner) app
   where
+    enc = routePrism @r
+    -- Like Warp.runSettings but takes *optional* port. When no port is set, a
+    -- free (random) port is used.
+    warpRunSettings :: Warp.Settings -> Maybe Port -> (Port -> IO a) -> Wai.Application -> IO ()
+    warpRunSettings settings mPort banner app = do
+      case mPort of
+        Nothing ->
+          Warp.withApplicationSettings settings (pure app) $ \port -> do
+            void $ banner port
+            threadDelay maxBound
+        Just port -> do
+          void $ banner port
+          Warp.runSettings (settings & Warp.setPort port) app
     wsApp pendingConn = do
       conn :: WS.Connection <- lift $ WS.acceptRequest pendingConn
       logger <- askLoggerIO
       lift $
-        WS.withPingThread conn 30 (pure ()) $
+        WS.withPingThread conn 30 pass $
           flip runLoggingT logger $ do
             subId <- LVar.addListener model
             let log lvl (s :: Text) =
-                  logWithoutLoc (toText @String $ printf "WS.Client.%.2d" subId) lvl s
+                  logWithoutLoc (toText @String $ printf "ema.ws.%.2d" subId) lvl s
             log LevelInfo "Connected"
             let askClientForRoute = do
                   msg :: Text <- liftIO $ WS.receiveData conn
@@ -90,20 +102,23 @@ runServerWithWebSocketHotReload host port model render = do
                   pure $ routeFromPathInfo val pathInfo
                 sendRouteHtmlToClient pathInfo s = do
                   decodeRouteWithCurrentModel pathInfo >>= \case
-                    Nothing ->
+                    Left err -> do
+                      log LevelError $ badRouteEncodingMsg err
+                      liftIO $ WS.sendTextData conn $ emaErrorHtmlResponse $ badRouteEncodingMsg err
+                    Right Nothing ->
                       liftIO $ WS.sendTextData conn $ emaErrorHtmlResponse decodeRouteNothingMsg
-                    Just r -> do
-                      case renderCatchingErrors logger s r of
+                    Right (Just r) -> do
+                      renderCatchingErrors s r >>= \case
                         AssetStatic staticPath ->
                           -- HACK: Websocket client should check for REDIRECT prefix.
                           -- Not bothering with JSON to avoid having to JSON parse every HTML dump.
                           liftIO $ WS.sendTextData conn $ "REDIRECT " <> toText staticPath
                         AssetGenerated Html html ->
-                          liftIO $ WS.sendTextData conn $ html <> emaStatusHtml
+                          liftIO $ WS.sendTextData conn $ html <> wsClientHtml
                         AssetGenerated Other _s ->
                           -- HACK: Websocket client should check for REDIRECT prefix.
                           -- Not bothering with JSON to avoid having to JSON parse every HTML dump.
-                          liftIO $ WS.sendTextData conn $ "REDIRECT " <> toText (encodeRoute s r)
+                          liftIO $ WS.sendTextData conn $ "REDIRECT " <> toText (review (fromPrism_ $ enc s) r)
                       log LevelDebug $ " ~~> " <> show r
                 loop = flip runLoggingT logger $ do
                   -- Notice that we @askClientForRoute@ in succession twice here.
@@ -130,7 +145,7 @@ runServerWithWebSocketHotReload host port model render = do
                         sendRouteHtmlToClient mNextRoute =<< LVar.get model
                         lift loop
             liftIO (try loop) >>= \case
-              Right () -> pure ()
+              Right () -> pass
               Left (connExc :: ConnectionException) -> do
                 case connExc of
                   WS.CloseRequest _ (decodeUtf8 -> reason) ->
@@ -138,75 +153,93 @@ runServerWithWebSocketHotReload host port model render = do
                   _ ->
                     log LevelError $ "Websocket error: " <> show connExc
                 LVar.removeListener model subId
-    assetsMiddleware =
-      Static.static
     httpApp logger req f = do
       flip runLoggingT logger $ do
         val <- LVar.get model
         let path = Wai.pathInfo req
             mr = routeFromPathInfo val path
-        logInfoNS "HTTP" $ show path <> " as " <> show mr
+        logInfoNS "ema.http" $ "GET " <> ("/" <> T.intercalate "/" path) <> " as " <> show mr
         case mr of
-          Nothing ->
-            liftIO $ f $ Wai.responseLBS H.status404 [(H.hContentType, "text/plain")] $ encodeUtf8 decodeRouteNothingMsg
-          Just r -> do
-            case renderCatchingErrors logger val r of
+          Left err -> do
+            logErrorNS "App" $ badRouteEncodingMsg err
+            let s = emaErrorHtmlResponse (badRouteEncodingMsg err) <> wsClientJS
+            liftIO $ f $ Wai.responseLBS H.status500 [(H.hContentType, "text/html")] s
+          Right Nothing -> do
+            let s = emaErrorHtmlResponse decodeRouteNothingMsg <> wsClientJS
+            liftIO $ f $ Wai.responseLBS H.status404 [(H.hContentType, "text/html")] s
+          Right (Just r) -> do
+            renderCatchingErrors val r >>= \case
               AssetStatic staticPath -> do
                 let mimeType = Static.getMimeType staticPath
                 liftIO $ f $ Wai.responseFile H.status200 [(H.hContentType, mimeType)] staticPath Nothing
               AssetGenerated Html html -> do
-                let s = html <> emaStatusHtml <> wsClientShim
+                let s = html <> wsClientHtml <> wsClientJS
                 liftIO $ f $ Wai.responseLBS H.status200 [(H.hContentType, "text/html")] s
               AssetGenerated Other s -> do
-                let mimeType = Static.getMimeType $ encodeRoute val r
+                let mimeType = Static.getMimeType $ review (fromPrism_ $ enc val) r
                 liftIO $ f $ Wai.responseLBS H.status200 [(H.hContentType, mimeType)] s
-    renderCatchingErrors logger m r =
-      unsafeCatch (render m r) $ \(err :: SomeException) ->
-        unsafePerformIO $ do
-          -- Log the error first.
-          flip runLoggingT logger $ logErrorNS "App" $ show @Text err
-          pure $
-            AssetGenerated Html . emaErrorHtml $
-              show @Text err
+    renderCatchingErrors m r =
+      catch (siteOutput (fromPrism_ $ enc m) m r) $ \(err :: SomeException) -> do
+        -- Log the error first.
+        logErrorNS "App" $ show @Text err
+        pure $
+          AssetGenerated Html . mkHtmlErrorMsg $
+            show @Text err
     routeFromPathInfo m =
       decodeUrlRoute m . T.intercalate "/"
-    -- TODO: It would be good have this also get us the stack trace.
-    unsafeCatch :: Exception e => a -> (e -> a) -> a
-    unsafeCatch x f = unsafePerformIO $ catch (seq x $ pure x) (pure . f)
+    -- Decode an URL path into a route
+    --
+    -- This function is used only in live server. If the route is not
+    -- isomoprhic, this returns a Left, with the mismatched encoding.
+    decodeUrlRoute :: RouteModel r -> Text -> Either (BadRouteEncoding r) (Maybe r)
+    decodeUrlRoute m (urlToFilePath -> s) = do
+      case checkRoutePrismGivenFilePath enc m s of
+        Left (r, log) -> Left $ BadRouteEncoding s r log
+        Right mr -> Right mr
 
 -- | A basic error response for displaying in the browser
 emaErrorHtmlResponse :: Text -> LByteString
 emaErrorHtmlResponse err =
-  emaErrorHtml err <> emaStatusHtml
+  mkHtmlErrorMsg err <> wsClientHtml
 
-emaErrorHtml :: Text -> LByteString
-emaErrorHtml s =
+-- TODO: Make this pretty
+mkHtmlErrorMsg :: Text -> LByteString
+mkHtmlErrorMsg s =
   encodeUtf8 $
-    "<html><head><meta charset=\"UTF-8\"></head><body><h1>Ema App threw an exception</h1><pre style=\"border: 1px solid; padding: 1em 1em 1em 1em;\">"
+    "<html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" /></head><body class=\"overflow-y: scroll;\"><h1>Ema App threw an exception</h1><pre style=\"font-family: monospace; border: 1px solid; padding: 1em 1em 1em 1em; overflow-wrap: anywhere;\">"
       <> s
       <> "</pre><p>Once you fix the source of the error, this page will automatically refresh.</body>"
 
--- | Return the equivalent of WAI's @pathInfo@, from the raw path string
--- (`document.location.pathname`) the browser sends us.
+{- | Return the equivalent of WAI's @pathInfo@, from the raw path string
+ (`document.location.pathname`) the browser sends us.
+-}
 pathInfoFromWsMsg :: Text -> [Text]
 pathInfoFromWsMsg =
   filter (/= "") . T.splitOn "/" . T.drop 1
 
--- | Decode a URL path into a route
---
--- This function is used only in live server.
-decodeUrlRoute :: forall r. Ema r => ModelFor r -> Text -> Maybe r
-decodeUrlRoute model (toString -> s) = do
-  decodeRoute @r model s
-    <|> decodeRoute @r model (s <> ".html")
-    <|> decodeRoute @r model (s </> "index.html")
-
 decodeRouteNothingMsg :: Text
-decodeRouteNothingMsg = "Ema: 404 (decodeRoute returned Nothing)"
+decodeRouteNothingMsg = "Ema: 404 (route decoding returned Nothing)"
+
+data BadRouteEncoding r = BadRouteEncoding
+  { _bre_urlFilePath :: FilePath
+  , _bre_decodedRoute :: r
+  , _bre_checkLog :: [(FilePath, Text)]
+  }
+  deriving stock (Show)
+
+badRouteEncodingMsg :: Show r => BadRouteEncoding r -> Text
+badRouteEncodingMsg BadRouteEncoding {..} =
+  toText $
+    "Ema: URL '" <> show _bre_urlFilePath
+      <> "' decodes to '"
+      <> show _bre_decodedRoute
+      <> "' but it is not isomporphic on any candidates: \n"
+      <> T.intercalate "\n" (_bre_checkLog <&> \(candidate, log) -> show candidate <> ": " <> log)
+      <> " \nYou should fix your routePrism."
 
 -- Browser-side JavaScript code for interacting with the Haskell server
-wsClientShim :: LByteString
-wsClientShim =
+wsClientJS :: LByteString
+wsClientJS =
   encodeUtf8
     [text|
         <script type="module" src="https://cdn.jsdelivr.net/npm/morphdom@2.6.1/dist/morphdom-umd.min.js"></script>
@@ -303,12 +336,28 @@ wsClientShim =
              sendObservePath(path);
           }
 
+          function scrollToAnchor(hash) {
+            console.log(`ema: Scroll to $${hash}`)
+            var el = document.querySelector(hash);
+            if (el !== null) {
+              el.scrollIntoView({ behavior: 'smooth' });
+            }
+          };
+
           function handleRouteClicks(e) {
               const origin = e.target.closest("a");
               if (origin) {
                 if (window.location.host === origin.host && origin.getAttribute("target") != "_blank") {
-                  switchRoute(origin.pathname, origin.hash);
-                  e.preventDefault();
+                  if (origin.getAttribute("href").startsWith("#")) {
+                    // Switching to local anchor
+                    window.history.pushState({}, "", window.location.pathname + origin.hash);
+                    scrollToAnchor(window.location.hash);
+                    e.preventDefault();
+                  }else{
+                    // Switching to another route
+                    switchRoute(origin.pathname, origin.hash);
+                    e.preventDefault();
+                  }
                 };
               }
             };
@@ -346,6 +395,8 @@ wsClientShim =
             setTimeout(function () {init(true);}, 400);
           };
 
+          
+
           ws.onmessage = evt => {
             if (evt.data.startsWith("REDIRECT ")) {
               console.log("ema: redirect");
@@ -359,10 +410,7 @@ wsClientShim =
                 routeVisible = document.location.pathname;
               }
               if (window.location.hash) {
-                var el = document.querySelector(window.location.hash);
-                if (el !== null) {
-                  el.scrollIntoView({ behavior: 'smooth' });
-                }
+                scrollToAnchor(window.location.hash);
               }
               watchCurrentRoute();
             };
@@ -386,45 +434,127 @@ wsClientShim =
         </script>
     |]
 
-emaStatusHtml :: LByteString
-emaStatusHtml =
+-- The inline CSS here is roughly analogous to the ones generated by Tailwind.
+-- See the original version based on Tailwind`: https://gist.github.com/srid/2471813953a6df9b24909b9bb1d3cd2b
+wsClientHtml :: LByteString
+wsClientHtml =
   encodeUtf8
     [text|
-      <div class="absolute top-0 left-0 p-2" style="display: none;" id="ema-indicator">
+      <div 
+        style="
+          display: none;
+          position: absolute;
+          top: 0px;
+          left: 0px;
+          padding: 0.5rem;
+          font-size: 12px;
+          line-height: 18px;
+          tab-size: 4;
+          text-size-adjust: 100%;
+        " 
+        id="ema-indicator">
         <div
-          class="
-            flex overflow-hidden items-center p-2 text-xs gap-2
-            h-8 border-2 border-gray-200 bg-white rounded-full shadow-lg
-            transition-[width,height] duration-500 ease-in-out w-8 hover:w-full
+          style="
+            display: flex;
+            overflow: hidden;
+            font-size: 0.75rem;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem;
+            height: 2rem;
+            width: 2rem;
+            box-sizing: border-box;
+            border-style: solid;
+            border-width: 2px;
+            border-color: rgb(229 231 235);
+            background-color: rgb(255 255 255);
+            border-radius: 9999px;
+            box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+            transition-property: width, height;
+            transition-duration: 500ms;
+          	transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
           "
+          onMouseOver="this.style.width='100%'"
+          onMouseOut="this.style.width='2rem'"
           id="ema-status"
           title="Ema Status"
         >
           <div
             hidden
-            class="flex-none w-3 h-3 bg-green-600 rounded-full"
+            style="
+              flex: none;
+              width: 0.75rem;
+              height: 0.75rem;
+              background-color: rgb(22 163 74);
+              border-radius: 9999px;
+            "
             id="ema-connected"
           ></div>
           <div
             hidden
-            class="flex-none w-3 h-3 rounded-full animate-spin bg-gradient-to-r from-blue-300 to-blue-600"
+            style="
+              flex: none;
+              width: 0.75rem;
+              height: 0.75rem;
+              border-radius: 9999px;
+            	animation: spin 1s linear infinite;
+              background-image: linear-gradient(to right, var(--tw-gradient-stops));
+              --tw-gradient-from: #93c5fd;
+              --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to);
+              --tw-gradient-to: #2563eb;
+            "
             id="ema-reloading"
-          ></div>
+          ><style>
+            @keyframes spin {
+              from {
+                transform: rotate(0deg);
+              }
+              to {
+                transform: rotate(360deg);
+              }
+            }
+          </style></div>
           <div
             hidden
-            class="flex-none w-3 h-3 bg-yellow-500 rounded-full"
+            style="
+              flex: none;
+              width: 0.75rem;
+              height: 0.75rem;
+              border-radius: 9999px;
+            	background-color: rgb(234 179 8);
+            "
             id="ema-connecting"
           >
             <div
-              class="flex-none w-3 h-3 bg-yellow-500 rounded-full animate-ping"
-            ></div>
+              style="
+                flex: none;
+                width: 0.75rem;
+                height: 0.75rem;
+                border-radius: 9999px;
+                background-color: rgb(234 179 8);
+                animation: ping 1s cubic-bezier(0, 0, 0.2, 1) infinite;
+              "
+            ><style>
+              @keyframes ping {
+                75%, 100% {
+                  transform: scale(2);
+                  opacity: 0;
+                }
+              }
+          </style></div>
           </div>
           <div
             hidden
-            class="flex-none w-3 h-3 bg-red-500 rounded-full"
+            style="
+              flex: none;
+              width: 0.75rem;
+              height: 0.75rem;
+              border-radius: 9999px;
+              background-color: rgb(239 68 68);
+            "
             id="ema-disconnected"
           ></div>
-          <p class="whitespace-nowrap" id="ema-message"></p>
+          <p style="white-space: nowrap;" id="ema-message"></p>
         </div>
       </div>
   |]
